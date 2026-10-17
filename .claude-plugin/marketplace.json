@@ -1,0 +1,5 @@
+{
+  "name": "cc-tools",
+  "owner": { "name": "kaikaichuang" },
+  "plugins": [{ "name": "cc-archive", "source": "./plugins/cc-archive" }]
+}

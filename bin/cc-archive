@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""Archive / restore Claude Code sessions: archived sessions leave /resume, nothing is deleted.
+
+  cc-archive                 picker (a plain list when piped)
+  cc-archive ID...           archive (an ID prefix is enough); a session that is
+                             still open is archived as soon as it closes
+  cc-archive -l              list archived sessions
+  cc-archive -r ID...        restore, or cancel a pending archive
+  cc-archive --restore-all   restore every archived session of every project
+  cc-archive --update        update this install (git pull)
+  -p DIR                     project DIR instead of the current directory
+
+picker keys: up/down select, ctrl+a archive/restore, enter resume, q quit
+  [A] archived   [P] archived when it closes   *  open in a running claude
+"""
+import argparse
+import curses
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+VERSION = "0.3.0"
+CLAUDE = Path.home() / ".claude"
+PROJECTS = CLAUDE / "projects"
+DATA = Path(os.environ.get("CC_ARCHIVE_DIR") or Path.home() / ".local/share/cc-archive")
+PENDING = DATA / ".pending"
+RECENT_SECONDS = 120  # counts as open when the running-session registry cannot be read
+QUIET_SECONDS = 10  # a closed session is left alone until its last writes have settled
+
+
+def project_key(path):
+    return re.sub(r"[^a-zA-Z0-9]", "-", str(Path(path).resolve()))
+
+
+def session_ids(folder):
+    return {p.name.split(".")[0] for p in folder.glob("*.jsonl")} if folder.is_dir() else set()
+
+
+def session_files(folder, sid):
+    return [p for p in folder.iterdir() if p.name.split(".")[0] == sid]
+
+
+def newest_mtime(folder, sid):
+    return max(p.stat().st_mtime for p in session_files(folder, sid))
+
+
+def open_sessions():
+    """Ids of sessions held by a running claude (it registers in ~/.claude/sessions/<pid>.json),
+    or None when there is no registry or it is not in the format this script knows."""
+    registry = CLAUDE / "sessions"
+    if not registry.is_dir():
+        return None
+    ids = set()
+    for f in registry.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue  # being rewritten right now
+        if not isinstance(d, dict) or not isinstance(d.get("pid"), int) or not d.get("sessionId"):
+            return None
+        try:
+            os.kill(d["pid"], 0)
+        except PermissionError:
+            pass  # alive, just not ours to signal
+        except OSError:
+            continue
+        ids.add(d["sessionId"])
+    return ids
+
+
+def is_open(folder, sid, opened):
+    idle = time.time() - newest_mtime(folder, sid)
+    if opened is None:
+        return idle < RECENT_SECONDS
+    return sid in opened or idle < QUIET_SECONDS
+
+
+def info(folder, sid):
+    """(last activity time, title), picked the same way /resume does:
+    custom title (/rename) > AI title > summary > first prompt."""
+    titles, first_prompt, last = {}, None, None
+    for f in sorted(folder.glob(f"{sid}*.jsonl")):
+        for line in f.open(errors="ignore"):
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            t = d.get("type")
+            if t in ("custom-title", "ai-title", "summary"):
+                titles[t] = d.get("customTitle") or d.get("aiTitle") or d.get("summary")
+            elif t == "user" and first_prompt is None and not d.get("isSidechain"):
+                c = (d.get("message") or {}).get("content")
+                if isinstance(c, str) and not c.startswith("<"):
+                    first_prompt = c
+            if d.get("timestamp"):
+                last = max(last or "", d["timestamp"])
+    name = titles.get("custom-title") or titles.get("ai-title") or titles.get("summary") or first_prompt
+    when = datetime.fromisoformat(last.replace("Z", "+00:00")).timestamp() if last else newest_mtime(folder, sid)
+    return when, (name or "(empty)").replace("\n", " ")[:60]
+
+
+def resolve(folder, prefix):
+    """The one session id in folder starting with prefix. A full id is also looked up in
+    every project, so callers that only know the id (the /archive plugin) need no -p."""
+    matches = [s for s in session_ids(folder) if s.startswith(prefix)]
+    if not matches and len(prefix) == 36:
+        for other in folder.parent.glob("*/"):
+            if prefix in session_ids(other):
+                return other, prefix
+    if len(matches) != 1:
+        raise ValueError(f"'{prefix}': {'no' if not matches else 'ambiguous'} match in {folder}")
+    return folder, matches[0]
+
+
+def move(src, dst, sid, touch=False):
+    files = session_files(src, sid)
+    dst.mkdir(parents=True, exist_ok=True)
+    for p in files:
+        if (dst / p.name).exists():
+            raise ValueError(f"{dst / p.name} already exists, not overwriting")
+    for p in files:
+        shutil.move(str(p), str(dst / p.name))
+        if touch:  # so Claude's cleanupPeriodDays does not delete a long-archived session on restore
+            os.utime(dst / p.name)
+
+
+def archive_dir(live_folder):
+    return DATA / live_folder.name
+
+
+def archive(live, prefix, opened):
+    folder, sid = resolve(live, prefix)
+    if is_open(folder, sid, opened):
+        PENDING.mkdir(parents=True, exist_ok=True)
+        (PENDING / sid).write_text(str(folder))
+        return f"{sid[:8]} is open: it will be archived when it closes"
+    move(folder, archive_dir(folder), sid)
+    (PENDING / sid).unlink(missing_ok=True)
+    return f"{sid[:8]} archived"
+
+
+def restore(live, prefix):
+    pending = [p for p in PENDING.glob(f"{prefix}*")] if PENDING.is_dir() else []
+    if len(pending) == 1:
+        pending[0].unlink()
+        return f"{pending[0].name[:8]} will no longer be archived when it closes"
+    folder, sid = resolve(archive_dir(live), prefix)
+    move(folder, PROJECTS / folder.name, sid, touch=True)
+    return f"{sid[:8]} restored"
+
+
+def run_pending(wait=0):
+    """Archive the sessions marked pending once they are no longer open."""
+    deadline = time.time() + wait
+    while True:
+        opened = open_sessions()
+        for marker in PENDING.glob("*") if PENDING.is_dir() else []:
+            folder, sid = Path(marker.read_text().strip()), marker.name
+            if not folder.is_dir() or sid not in session_ids(folder):
+                marker.unlink()
+            elif not is_open(folder, sid, opened):
+                try:
+                    move(folder, archive_dir(folder), sid)
+                    marker.unlink()
+                except ValueError as e:
+                    print(f"cc-archive: pending {sid[:8]}: {e}", file=sys.stderr)
+        if not (PENDING.is_dir() and any(PENDING.iterdir())) or time.time() >= deadline:
+            return
+        time.sleep(1)
+
+
+def rows(live):
+    opened, archive = open_sessions(), archive_dir(live)
+    pending = {p.name for p in PENDING.glob("*")} if PENDING.is_dir() else set()
+    out = []
+    for folder in (live, archive):
+        for sid in session_ids(folder):
+            if folder == archive:
+                state = "[A]"
+            elif sid in pending:
+                state = "[P]"
+            else:
+                state = " * " if is_open(folder, sid, opened) else "   "
+            out.append((*info(folder, sid), sid, state))
+    return sorted(out, reverse=True)
+
+
+def show(folder):
+    found = sorted(((*info(folder, sid), sid) for sid in session_ids(folder)), reverse=True)
+    if not found:
+        print(f"(no sessions in {folder})")
+    for when, name, sid in found:
+        size = sum(p.stat().st_size for p in folder.glob(f"{sid}*.jsonl"))
+        print(f"{sid[:8]}  {datetime.fromtimestamp(when):%m-%d %H:%M}  {size // 1024:>6}K  {name}")
+
+
+def pick(stdscr, live):
+    """Return the session id to resume, or None."""
+    curses.curs_set(0)
+    curses.use_default_colors()
+    items, cur, msg = rows(live), 0, ""
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        stdscr.addnstr(0, 0, "up/down select  ctrl+a archive/restore  enter resume  q quit", w - 1, curses.A_BOLD)
+        top = max(0, cur - (h - 4))
+        for i, (when, name, sid, state) in enumerate(items[top:top + h - 3], top):
+            line = f"{state} {sid[:8]}  {datetime.fromtimestamp(when):%m-%d %H:%M}  {name}"
+            attr = (curses.A_REVERSE if i == cur else 0) | (curses.A_DIM if state in ("[A]", "[P]") else 0)
+            stdscr.addnstr(i - top + 1, 0, line, w - 1, attr)
+        if not items:
+            stdscr.addnstr(1, 0, "(no sessions)", w - 1)
+        stdscr.addnstr(h - 1, 0, msg, w - 1)
+        key, msg = stdscr.getch(), ""
+        if key in (ord("q"), 27):
+            return None
+        if not items:
+            continue
+        sid, state = items[cur][2], items[cur][3]
+        if key in (curses.KEY_UP, ord("k")):
+            cur = max(0, cur - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            cur = min(len(items) - 1, cur + 1)
+        elif key == 1:  # ctrl+a
+            try:
+                msg = restore(live, sid) if state in ("[A]", "[P]") else archive(live, sid, open_sessions())
+            except ValueError as e:
+                msg = str(e)
+            items = rows(live)
+            cur = next((i for i, r in enumerate(items) if r[2] == sid), 0)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            if state == "[A]":
+                msg = "archived session: press ctrl+a to restore it first"
+            else:
+                return sid
+
+
+def update():
+    repo = Path(__file__).resolve().parent.parent
+    if not (repo / ".git").exists():
+        sys.exit(f"{repo} is not a git checkout; reinstall with install.sh")
+    subprocess.run(["git", "-C", str(repo), "pull", "--ff-only"], check=True)
+    subprocess.run([sys.executable, str(Path(__file__).resolve()), "--version"])
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("ids", nargs="*")
+    ap.add_argument("-l", "--list-archived", action="store_true")
+    ap.add_argument("-r", "--restore", action="store_true")
+    ap.add_argument("--restore-all", action="store_true")
+    ap.add_argument("-p", "--project", default=".")
+    ap.add_argument("--pending", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--wait", type=int, default=0, help=argparse.SUPPRESS)
+    ap.add_argument("--update", action="store_true")
+    ap.add_argument("--version", action="version", version=f"cc-archive {VERSION}")
+    args = ap.parse_args()
+
+    live = PROJECTS / project_key(args.project)
+    run_pending(args.wait if args.pending else 0)
+
+    try:
+        if args.pending:
+            pass
+        elif args.update:
+            update()
+        elif args.restore_all:
+            for folder in DATA.glob("*/"):
+                for sid in session_ids(folder):
+                    print(restore(PROJECTS / folder.name, sid))
+        elif args.ids:
+            opened = open_sessions()
+            for prefix in args.ids:
+                print(restore(live, prefix) if args.restore else archive(live, prefix, opened))
+        elif args.list_archived or args.restore:
+            show(archive_dir(live))
+        elif sys.stdout.isatty():
+            sid = curses.wrapper(pick, live)
+            if sid:
+                os.chdir(args.project)
+                os.execvp("claude", ["claude", "--resume", sid])
+        else:
+            show(live)
+    except ValueError as e:
+        sys.exit(str(e))
+
+
+if __name__ == "__main__":
+    main()
