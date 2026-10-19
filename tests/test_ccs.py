@@ -173,6 +173,12 @@ class CcArchiveTest(unittest.TestCase):
         self.assertIn("plugin uninstall ccs@cc-tools", calls)
         self.assertIn("plugin marketplace remove cc-tools", calls)
 
+    def test_session_a_live_job_started_with_counts_as_open(self):
+        # the job named after A now hosts another conversation, but may still go back to A
+        (self.home / ".claude/sessions/1.json").write_text(
+            json.dumps({"pid": os.getpid(), "sessionId": B, "jobId": A[:8]}))
+        self.assertIn("when it closes", self.cli("aaaa"))
+
     def test_restore_cancels_pending(self):
         self.set_open(A)
         self.cli("aaaa")
@@ -199,6 +205,13 @@ class CcArchiveTest(unittest.TestCase):
 
     def test_copy_with_fewer_messages_is_archived(self):
         self.copy_of_a(C)
+        self.cli("--pending")
+        self.assertTrue((self.archived / f"{C}.jsonl").exists())
+        self.assertTrue((self.live / f"{A}.jsonl").exists())
+
+    def test_untouched_copy_loses_to_the_original_even_if_newer(self):
+        self.copy_of_a(C)
+        os.utime(self.live / f"{A}.jsonl", (time.time() - 7200, time.time() - 7200))  # copy is newer
         self.cli("--pending")
         self.assertTrue((self.archived / f"{C}.jsonl").exists())
         self.assertTrue((self.live / f"{A}.jsonl").exists())
