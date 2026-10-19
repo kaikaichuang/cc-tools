@@ -8,7 +8,10 @@
   ccs -r ID...        restore, or cancel a pending archive
   ccs --restore-all   restore every archived session of every project
   ccs --update        update this install (git pull, then install.sh)
+  ccs --uninstall     restore every archived session, then remove ccs, its plugin and its data
   -p DIR              project DIR instead of the current directory
+  -f                  archive now even if ccs cannot tell the session is closed (only when
+                      you know no claude is using it)
 
 Every run also archives the copies Claude Code makes when a conversation is moved to the
 background (exiting while an agent runs), keeping the most complete one. /branch is not affected.
@@ -30,13 +33,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 CLAUDE = Path.home() / ".claude"
 PROJECTS = CLAUDE / "projects"
 DATA = Path(os.environ.get("CCS_DIR") or Path.home() / ".local/share/ccs")
 PENDING = DATA / ".pending"
 KEEP = DATA / ".keep"  # copies restored by hand, which archive_copies leaves alone
-RECENT_SECONDS = 120  # counts as open when the running-session registry cannot be read
 QUIET_SECONDS = 10  # a closed session is left alone until its last writes have settled
 
 
@@ -58,16 +60,26 @@ def newest_mtime(folder, sid):
 
 def open_sessions():
     """Ids of sessions held by a running claude (it registers in ~/.claude/sessions/<pid>.json),
-    or None when there is no registry or it is not in the format this script knows."""
+    or None when that cannot be told: no registry, a format this script does not know, or an
+    entry that stays unreadable (claude rewrites them, so a read can land mid-write)."""
     registry = CLAUDE / "sessions"
     if not registry.is_dir():
         return None
     ids = set()
     for f in registry.glob("*.json"):
-        try:
-            d = json.loads(f.read_text())
-        except (OSError, ValueError):
-            continue  # being rewritten right now
+        for attempt in range(3):
+            try:
+                d = json.loads(f.read_text())
+                break
+            except FileNotFoundError:
+                d = None  # its claude exited meanwhile
+                break
+            except (OSError, ValueError):
+                time.sleep(0.1)
+        else:
+            return None
+        if d is None:
+            continue
         if not isinstance(d, dict) or not isinstance(d.get("pid"), int) or not d.get("sessionId"):
             return None
         try:
@@ -81,10 +93,11 @@ def open_sessions():
 
 
 def is_open(folder, sid, opened):
-    idle = time.time() - newest_mtime(folder, sid)
+    """Whether sid may still be in use. Without a readable registry nothing counts as closed:
+    a file left untouched for a while does not mean its claude has exited."""
     if opened is None:
-        return idle < RECENT_SECONDS
-    return sid in opened or idle < QUIET_SECONDS
+        return True
+    return sid in opened or time.time() - newest_mtime(folder, sid) < QUIET_SECONDS
 
 
 def info(folder, sid):
@@ -93,22 +106,35 @@ def info(folder, sid):
     titles, first_prompt, last = {}, None, None
     for f in sorted(folder.glob(f"{sid}*.jsonl")):
         for line in f.open(errors="ignore"):
-            try:
-                d = json.loads(line)
-            except ValueError:
-                continue
+            d = record(line)
             t = d.get("type")
             if t in ("custom-title", "ai-title", "summary"):
-                titles[t] = d.get("customTitle") or d.get("aiTitle") or d.get("summary")
+                name = d.get("customTitle") or d.get("aiTitle") or d.get("summary")
+                if isinstance(name, str):
+                    titles[t] = name
             elif t == "user" and first_prompt is None and not d.get("isSidechain"):
-                c = (d.get("message") or {}).get("content")
+                message = d.get("message")
+                c = message.get("content") if isinstance(message, dict) else None
                 if isinstance(c, str) and not c.startswith("<"):
                     first_prompt = c
-            if d.get("timestamp"):
+            if isinstance(d.get("timestamp"), str):
                 last = max(last or "", d["timestamp"])
     name = titles.get("custom-title") or titles.get("ai-title") or titles.get("summary") or first_prompt
-    when = datetime.fromisoformat(last.replace("Z", "+00:00")).timestamp() if last else newest_mtime(folder, sid)
+    try:
+        when = datetime.fromisoformat(last.replace("Z", "+00:00")).timestamp()
+    except (AttributeError, ValueError):
+        when = newest_mtime(folder, sid)
     return when, (name or "(empty)").replace("\n", " ")[:60]
+
+
+def record(line):
+    """A transcript line as a dict; {} for anything else, so a record this script does not
+    understand is skipped instead of breaking the list."""
+    try:
+        d = json.loads(line)
+    except ValueError:
+        return {}
+    return d if isinstance(d, dict) else {}
 
 
 def resolve(folder, prefix):
@@ -130,9 +156,17 @@ def move(src, dst, sid, touch=False):
     for p in files:
         if (dst / p.name).exists():
             raise ValueError(f"{dst / p.name} already exists, not overwriting")
-    for p in files:
-        shutil.move(str(p), str(dst / p.name))
-        if touch:  # so Claude's cleanupPeriodDays does not delete a long-archived session on restore
+    moved = []
+    try:
+        for p in files:
+            shutil.move(str(p), str(dst / p.name))
+            moved.append(p)
+    except OSError as e:  # put back what already moved, so a session is never split in two
+        for p in reversed(moved):
+            shutil.move(str(dst / p.name), str(p))
+        raise ValueError(f"{sid[:8]}: could not move {src} -> {dst}: {e}; nothing was moved")
+    if touch:  # so Claude's cleanupPeriodDays does not delete a long-archived session on restore
+        for p in files:
             os.utime(dst / p.name)
 
 
@@ -140,9 +174,12 @@ def archive_dir(live_folder):
     return DATA / live_folder.name
 
 
-def archive(live, prefix, opened):
+def archive(live, prefix, opened, force=False):
     folder, sid = resolve(live, prefix)
-    if is_open(folder, sid, opened):
+    if opened is None and not force:
+        raise ValueError(f"{sid[:8]}: cannot tell whether it is open (Claude's session registry "
+                         f"is unreadable). If no claude is using it, run: ccs -f {sid[:8]}")
+    if is_open(folder, sid, opened) and not force:
         PENDING.mkdir(parents=True, exist_ok=True)
         (PENDING / sid).write_text(str(folder))
         return f"{sid[:8]} is open: it will be archived when it closes"
@@ -152,10 +189,13 @@ def archive(live, prefix, opened):
 
 
 def restore(live, prefix):
-    pending = [p for p in PENDING.glob(f"{prefix}*")] if PENDING.is_dir() else []
-    if len(pending) == 1:
-        pending[0].unlink()
-        return f"{pending[0].name[:8]} will no longer be archived when it closes"
+    pending = [p.name for p in PENDING.glob(f"{prefix}*")] if PENDING.is_dir() else []
+    archived = [s for s in session_ids(archive_dir(live)) if s.startswith(prefix)]
+    if len(pending) + len(archived) > 1:
+        raise ValueError(f"'{prefix}': ambiguous, matches " + ", ".join(s[:8] for s in pending + archived))
+    if pending:
+        (PENDING / pending[0]).unlink()
+        return f"{pending[0][:8]} will no longer be archived when it closes"
     folder, sid = resolve(archive_dir(live), prefix)
     move(folder, PROJECTS / folder.name, sid, touch=True)
     KEEP.mkdir(parents=True, exist_ok=True)
@@ -202,7 +242,7 @@ def copies(folder, opened):
         for f in folder.glob(f"{sid}*.jsonl"):
             for line in f.open(errors="ignore"):
                 if '"type":"continued-in"' in line:
-                    target = json.loads(line).get("continuedInSessionId")
+                    target = record(line).get("continuedInSessionId")
                     if target in ids:
                         group[root(target)] = root(sid)
                 elif '"type":"user"' in line or '"type":"assistant"' in line:
@@ -319,6 +359,44 @@ def update():
     subprocess.run([sys.executable, str(Path(__file__).resolve()), "--version"])
 
 
+def uninstall():
+    """Undo everything ccs did: archived sessions back where Claude keeps them, then the plugin,
+    the command links and ccs's own data. Stops before removing anything if a restore fails."""
+    repo = Path(__file__).resolve().parent.parent
+    archived = [(folder, sid) for folder in DATA.glob("*/") for sid in session_ids(folder)]
+    if sys.stdin.isatty():
+        answer = input(f"Restore {len(archived)} archived session(s) and remove ccs? [y/N] ")
+        if answer.strip().lower() != "y":
+            sys.exit("cancelled")
+    for folder, sid in archived:
+        move(folder, PROJECTS / folder.name, sid, touch=True)
+        print(f"{sid[:8]} restored")
+
+    for argv in (["claude", "plugin", "uninstall", "ccs@cc-tools"],
+                 ["claude", "plugin", "marketplace", "remove", "cc-tools"]):
+        try:
+            subprocess.run(argv, capture_output=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            print(f"could not run: {' '.join(argv)}")
+    for link in (Path.home() / ".local/bin").glob("*"):
+        if link.is_symlink() and (repo / "bin") in link.resolve().parents:
+            link.unlink()
+            print(f"removed {link}")
+
+    # Only what ccs itself made, in case CCS_DIR points somewhere shared.
+    for marker_dir in (PENDING, KEEP):
+        for marker in marker_dir.glob("*") if marker_dir.is_dir() else []:
+            marker.unlink()
+    for d in [PENDING, KEEP, *DATA.glob("*/"), DATA]:
+        try:
+            d.rmdir()
+        except OSError:
+            pass
+    if DATA.exists():
+        print(f"left {DATA}: it holds files ccs did not make")
+    print(f"ccs is uninstalled. To delete its code too: rm -rf {repo}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("ids", nargs="*")
@@ -326,17 +404,20 @@ def main():
     ap.add_argument("-r", "--restore", action="store_true")
     ap.add_argument("--restore-all", action="store_true")
     ap.add_argument("-p", "--project", default=".")
+    ap.add_argument("-f", "--force", action="store_true")
     ap.add_argument("--pending", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--wait", type=int, default=0, help=argparse.SUPPRESS)
     ap.add_argument("--update", action="store_true")
+    ap.add_argument("--uninstall", action="store_true")
     ap.add_argument("--version", action="version", version=f"ccs {VERSION}")
     args = ap.parse_args()
 
     live = PROJECTS / project_key(args.project)
-    run_pending(args.wait if args.pending else 0)
-    archive_copies(live)
-
     try:
+        if args.uninstall:
+            return uninstall()
+        run_pending(args.wait if args.pending else 0)
+        archive_copies(live)
         if args.pending:
             pass
         elif args.update:
@@ -348,7 +429,7 @@ def main():
         elif args.ids:
             opened = open_sessions()
             for prefix in args.ids:
-                print(restore(live, prefix) if args.restore else archive(live, prefix, opened))
+                print(restore(live, prefix) if args.restore else archive(live, prefix, opened, args.force))
         elif args.list_archived or args.restore:
             show(archive_dir(live))
         elif sys.stdout.isatty():

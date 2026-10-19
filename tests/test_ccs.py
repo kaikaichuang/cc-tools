@@ -84,11 +84,94 @@ class CcArchiveTest(unittest.TestCase):
         self.cli("--pending")
         self.assertTrue((self.archived / f"{A}.jsonl").exists())
 
-    def test_unknown_registry_format_falls_back_to_file_age(self):
+    def cli_fails(self, *args):
+        env = {**os.environ, "HOME": str(self.home)}
+        env.pop("CCS_DIR", None)
+        r = subprocess.run([str(CLI), *args], cwd=self.project, env=env, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        return r.stderr
+
+    def test_unknown_registry_format_moves_nothing_unless_forced(self):
         (self.home / ".claude/sessions/1.json").write_text(json.dumps({"process": 1}))
-        os.utime(self.live / f"{A}.jsonl")  # just written
-        self.assertIn("when it closes", self.cli("aaaa"))
-        self.assertIn("archived", self.cli("bbbb"))  # untouched for an hour
+        self.assertIn("cannot tell", self.cli_fails("bbbb"))  # an hour idle proves nothing
+        self.assertTrue((self.live / f"{B}.jsonl").exists())
+        self.assertIn("archived", self.cli("-f", "bbbb"))
+
+    def test_unreadable_registry_entry_keeps_pending_session(self):
+        self.set_open(A)
+        self.cli("aaaa")
+        (self.home / ".claude/sessions/1.json").write_text('{"pid": 1, "sessio')  # caught mid-write
+        self.cli("--pending")
+        self.assertTrue((self.live / f"{A}.jsonl").exists())
+
+    def test_ambiguous_prefix_on_restore_does_nothing(self):
+        other = "aaaaaaaa-0000-0000-0000-000000000009"
+        (self.live / f"{other}.jsonl").write_text(record("user", "2026-01-04T10:00:00Z", message={"content": "x"}))
+        old = time.time() - 3600
+        os.utime(self.live / f"{other}.jsonl", (old, old))
+        self.cli(other)  # archived
+        self.set_open(A)
+        self.cli(A)  # pending
+        self.assertIn("ambiguous", self.cli_fails("-r", "aaaa"))
+        self.assertTrue((self.archived / f"{other}.jsonl").exists())
+        self.assertIn(A[:8], self.cli("-r", A))  # a full id still works
+
+    def test_malformed_records_do_not_break_the_list(self):
+        with open(self.live / f"{B}.jsonl", "a") as f:
+            f.write("\n".join(["", "[1, 2]", '"text"', '{"type":"user","message":"not a dict"}',
+                                '{"timestamp":5}', '{"type":"ai-title","aiTitle":["x"]}', "{broken"]))
+        self.assertIn("prompt B", self.cli())
+
+    def in_process(self, code):
+        """Run code with bin/ccs loaded as module m, in the fake HOME."""
+        r = subprocess.run(
+            [sys.executable, "-c", "import sys, shutil; from importlib.machinery import SourceFileLoader;"
+             f"m = SourceFileLoader('ccs', {str(CLI)!r}).load_module()\n" + code],
+            env={**os.environ, "HOME": str(self.home)}, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def test_failed_move_puts_back_what_moved(self):
+        out = self.in_process(
+            "real, calls = shutil.move, []\n"
+            "def flaky(a, b):\n"
+            "    calls.append(a)\n"
+            "    if len(calls) == 2: raise OSError('disk full')\n"
+            "    return real(a, b)\n"
+            "shutil.move = flaky\n"
+            "live = m.PROJECTS / m.project_key(" + repr(str(self.project)) + ")\n"
+            "try: m.move(live, m.archive_dir(live), " + repr(A) + ")\n"
+            "except ValueError as e: print(e)\n")
+        self.assertIn("nothing was moved", out)
+        self.assertTrue((self.live / f"{A}.jsonl").exists())
+        self.assertTrue((self.live / A / "tool.txt").exists())
+        self.assertFalse(self.archived.exists() and any(self.archived.iterdir()))
+
+    def test_uninstall_restores_everything_and_removes_ccs(self):
+        self.cli("bbbb")  # archived
+        self.set_open(A)
+        self.cli("aaaa")  # pending
+        bin_dir = self.home / ".local/bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "ccs").symlink_to(CLI)
+        (bin_dir / "other").write_text("not ours")
+        fake = self.home / "fakebin"
+        fake.mkdir()
+        (fake / "claude").write_text(f"#!/bin/sh\necho \"$@\" >> {self.home}/claude-calls\n")
+        (fake / "claude").chmod(0o755)
+        env = {**os.environ, "HOME": str(self.home), "PATH": f"{fake}:{os.environ['PATH']}"}
+        r = subprocess.run([str(CLI), "--uninstall"], cwd=self.project, env=env,
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        self.assertTrue((self.live / f"{B}.jsonl").exists())
+        self.assertTrue((self.live / f"{A}.jsonl").exists())
+        self.assertFalse((self.home / ".local/share/ccs").exists())
+        self.assertFalse((bin_dir / "ccs").exists())
+        self.assertTrue((bin_dir / "other").exists())
+        calls = (self.home / "claude-calls").read_text()
+        self.assertIn("plugin uninstall ccs@cc-tools", calls)
+        self.assertIn("plugin marketplace remove cc-tools", calls)
 
     def test_restore_cancels_pending(self):
         self.set_open(A)
