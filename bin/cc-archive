@@ -13,7 +13,9 @@
 Every run also archives the copies Claude Code makes when a conversation is moved to the
 background (exiting while an agent runs), keeping the most complete one. /branch is not affected.
 
-picker keys: up/down select, ctrl+a archive/restore, enter resume, q quit
+picker keys: up/down select, ctrl+a archive/restore, enter open, q quit
+  enter opens a session the way that makes no copy of it: `claude attach` while it runs
+  in the background, `claude --resume` otherwise
   [A] archived   [P] archived when it closes   *  open in a running claude
 """
 import argparse
@@ -28,7 +30,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 CLAUDE = Path.home() / ".claude"
 PROJECTS = CLAUDE / "projects"
 DATA = Path(os.environ.get("CC_ARCHIVE_DIR") or Path.home() / ".local/share/cc-archive")
@@ -250,14 +252,14 @@ def show(folder):
 
 
 def pick(stdscr, live):
-    """Return the session id to resume, or None."""
+    """Return the command that opens the chosen session, or None."""
     curses.curs_set(0)
     curses.use_default_colors()
     items, cur, msg = rows(live), 0, ""
     while True:
         stdscr.erase()
         h, w = stdscr.getmaxyx()
-        stdscr.addnstr(0, 0, "up/down select  ctrl+a archive/restore  enter resume  q quit", w - 1, curses.A_BOLD)
+        stdscr.addnstr(0, 0, "up/down select  ctrl+a archive/restore  enter open  q quit", w - 1, curses.A_BOLD)
         top = max(0, cur - (h - 4))
         for i, (when, name, sid, state) in enumerate(items[top:top + h - 3], top):
             line = f"{state} {sid[:8]}  {datetime.fromtimestamp(when):%m-%d %H:%M}  {name}"
@@ -287,7 +289,25 @@ def pick(stdscr, live):
             if state == "[A]":
                 msg = "archived session: press ctrl+a to restore it first"
             else:
-                return sid
+                argv, msg = open_command(sid)
+                if argv:
+                    return argv
+
+
+def open_command(sid):
+    """How to enter sid without Claude making a copy of it: `claude attach` while a background
+    session runs it, `claude --resume` when nothing does. Returns (argv, None) or (None, why not)."""
+    try:
+        r = subprocess.run(["claude", "agents", "--json"], capture_output=True, text=True, timeout=30)
+        agents = json.loads(r.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        agents = []
+    for a in agents:
+        if a.get("sessionId") == sid and a.get("kind") == "background":
+            return ["claude", "attach", a["id"]], None
+        if a.get("sessionId") == sid:
+            return None, f"{sid[:8]} is open in another claude window: switch to that window"
+    return ["claude", "--resume", sid], None
 
 
 def update():
@@ -331,10 +351,10 @@ def main():
         elif args.list_archived or args.restore:
             show(archive_dir(live))
         elif sys.stdout.isatty():
-            sid = curses.wrapper(pick, live)
-            if sid:
+            argv = curses.wrapper(pick, live)
+            if argv:
                 os.chdir(args.project)
-                os.execvp("claude", ["claude", "--resume", sid])
+                os.execvp(argv[0], argv)
         else:
             show(live)
     except ValueError as e:

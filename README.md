@@ -18,7 +18,15 @@ cc-archive --update        # 更新到最新版（git pull）
 cc-archive -p DIR ...      # 對別的專案資料夾操作
 ```
 
-選單操作：上下鍵選擇、`Ctrl+A` 封存／還原（再按一次就復原）、`Enter` 接續該 session、`q` 離開。
+選單操作：上下鍵選擇、`Ctrl+A` 封存／還原（再按一次就復原）、`Enter` 進入該 session、`q` 離開。
+
+按 `Enter` 時會自動選擇不會產生副本的進入方式：
+
+| session 的狀態 | Enter 會執行 |
+|---|---|
+| 正在背景跑 | `claude attach <id>` |
+| 在另一個 claude 視窗開著 | 不進入，提示你切到那個視窗 |
+| 沒有在跑 | `claude --resume <id>` |
 
 | 標記 | 意思 |
 |---|---|

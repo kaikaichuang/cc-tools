@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -142,6 +143,32 @@ class CcArchiveTest(unittest.TestCase):
         self.cli("-r", "cccc")
         self.cli("--pending")
         self.assertTrue((self.live / f"{C}.jsonl").exists())
+
+    def open_command(self, agents):
+        """bin/cc-archive's open_command, with `claude agents --json` answering agents."""
+        fake = self.home / "bin"
+        fake.mkdir(exist_ok=True)
+        (fake / "claude").write_text(f"#!/bin/sh\necho '{json.dumps(agents)}'\n")
+        (fake / "claude").chmod(0o755)
+        r = subprocess.run(
+            [sys.executable, "-c", "import sys; from importlib.machinery import SourceFileLoader;"
+             f"m = SourceFileLoader('cca', {str(CLI)!r}).load_module(); print(m.open_command({A!r}))"],
+            env={**os.environ, "HOME": str(self.home), "PATH": f"{fake}:{os.environ['PATH']}"},
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.strip()
+
+    def test_enter_attaches_to_a_running_background_session(self):
+        out = self.open_command([{"id": "aaaaaaaa", "kind": "background", "sessionId": A}])
+        self.assertIn("'claude', 'attach', 'aaaaaaaa'", out)
+
+    def test_enter_resumes_a_session_nothing_runs(self):
+        out = self.open_command([{"id": "bbbbbbbb", "kind": "background", "sessionId": B}])
+        self.assertIn(f"'claude', '--resume', '{A}'", out)
+
+    def test_enter_refuses_a_session_open_in_another_window(self):
+        out = self.open_command([{"kind": "interactive", "sessionId": A}])
+        self.assertIn("another claude window", out)
 
     def test_restore_all(self):
         self.cli("aaaa", "bbbb")
