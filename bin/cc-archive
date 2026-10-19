@@ -10,6 +10,9 @@
   cc-archive --update        update this install (git pull)
   -p DIR                     project DIR instead of the current directory
 
+Every run also archives the copies Claude Code makes when a conversation is moved to the
+background (exiting while an agent runs), keeping the most complete one. /branch is not affected.
+
 picker keys: up/down select, ctrl+a archive/restore, enter resume, q quit
   [A] archived   [P] archived when it closes   *  open in a running claude
 """
@@ -25,11 +28,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 CLAUDE = Path.home() / ".claude"
 PROJECTS = CLAUDE / "projects"
 DATA = Path(os.environ.get("CC_ARCHIVE_DIR") or Path.home() / ".local/share/cc-archive")
 PENDING = DATA / ".pending"
+KEEP = DATA / ".keep"  # copies restored by hand, which archive_copies leaves alone
 RECENT_SECONDS = 120  # counts as open when the running-session registry cannot be read
 QUIET_SECONDS = 10  # a closed session is left alone until its last writes have settled
 
@@ -152,6 +156,8 @@ def restore(live, prefix):
         return f"{pending[0].name[:8]} will no longer be archived when it closes"
     folder, sid = resolve(archive_dir(live), prefix)
     move(folder, PROJECTS / folder.name, sid, touch=True)
+    KEEP.mkdir(parents=True, exist_ok=True)
+    (KEEP / sid).touch()
     return f"{sid[:8]} restored"
 
 
@@ -173,6 +179,49 @@ def run_pending(wait=0):
         if not (PENDING.is_dir() and any(PENDING.iterdir())) or time.time() >= deadline:
             return
         time.sleep(1)
+
+
+def copies(folder, opened):
+    """Copies Claude Code made when it moved a conversation to a background session, except the
+    most complete one of each conversation (most messages, then the newest). Claude marks such a
+    move with a "continued-in" record; /branch and --fork-session write none, so deliberate
+    branches are never returned, and neither is a copy that is open or that was restored by hand."""
+    ids = session_ids(folder)
+    group = {sid: sid for sid in ids}
+
+    def root(sid):
+        while group[sid] != sid:
+            sid = group[sid]
+        return sid
+
+    size = {}
+    for sid in ids:
+        n = 0
+        for f in folder.glob(f"{sid}*.jsonl"):
+            for line in f.open(errors="ignore"):
+                if '"type":"continued-in"' in line:
+                    target = json.loads(line).get("continuedInSessionId")
+                    if target in ids:
+                        group[root(target)] = root(sid)
+                elif '"type":"user"' in line or '"type":"assistant"' in line:
+                    n += 1
+        size[sid] = (n, newest_mtime(folder, sid))
+
+    members = {}
+    for sid in ids:
+        members.setdefault(root(sid), []).append(sid)
+    out = []
+    for sids in members.values():
+        keep = max(sids, key=size.get)
+        out += [(sid, keep) for sid in sids
+                if sid != keep and not (KEEP / sid).exists() and not is_open(folder, sid, opened)]
+    return out
+
+
+def archive_copies(live):
+    for sid, keep in copies(live, open_sessions()):
+        move(live, archive_dir(live), sid)
+        print(f"{sid[:8]} archived: a copy of {keep[:8]}", file=sys.stderr)
 
 
 def rows(live):
@@ -264,6 +313,7 @@ def main():
 
     live = PROJECTS / project_key(args.project)
     run_pending(args.wait if args.pending else 0)
+    archive_copies(live)
 
     try:
         if args.pending:

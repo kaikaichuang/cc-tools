@@ -14,10 +14,11 @@ from pathlib import Path
 CLI = Path(__file__).resolve().parent.parent / "bin" / "cc-archive"
 A = "aaaaaaaa-0000-0000-0000-000000000001"
 B = "bbbbbbbb-0000-0000-0000-000000000002"
+C = "cccccccc-0000-0000-0000-000000000003"
 
 
 def record(type, ts, **fields):
-    return json.dumps({"type": type, "timestamp": ts, **fields})
+    return json.dumps({"type": type, "timestamp": ts, **fields}, separators=(",", ":"))  # as Claude writes them
 
 
 class CcArchiveTest(unittest.TestCase):
@@ -99,6 +100,48 @@ class CcArchiveTest(unittest.TestCase):
     def test_full_id_found_from_any_directory(self):
         self.assertIn("archived", self.cli(A, cwd=self.home))
         self.assertTrue((self.archived / f"{A}.jsonl").exists())
+
+    def copy_of_a(self, sid, extra=0, linked=True):
+        """Make sid a copy of A the way Claude Code does when moving A to the background."""
+        lines = (self.live / f"{A}.jsonl").read_text().splitlines()
+        lines += [record("user", f"2026-01-03T10:00:0{i}Z", message={"content": "more"}) for i in range(extra)]
+        (self.live / f"{sid}.jsonl").write_text("\n".join(lines))
+        if linked:
+            with open(self.live / f"{A}.jsonl", "a") as f:
+                f.write("\n" + record("continued-in", None, sessionId=A, continuedInSessionId=sid))
+        old = time.time() - 3600
+        os.utime(self.live / f"{A}.jsonl", (old, old))
+        os.utime(self.live / f"{sid}.jsonl", (old - 60, old - 60))
+
+    def test_copy_with_fewer_messages_is_archived(self):
+        self.copy_of_a(C)
+        self.cli("--pending")
+        self.assertTrue((self.archived / f"{C}.jsonl").exists())
+        self.assertTrue((self.live / f"{A}.jsonl").exists())
+
+    def test_original_is_archived_when_the_copy_has_more(self):
+        self.copy_of_a(C, extra=2)  # the conversation went on in the copy
+        self.cli("--pending")
+        self.assertTrue((self.archived / f"{A}.jsonl").exists())
+        self.assertTrue((self.live / f"{C}.jsonl").exists())
+
+    def test_branch_is_never_archived(self):
+        self.copy_of_a(C, linked=False)  # /branch, --fork-session: no continued-in record
+        self.cli("--pending")
+        self.assertTrue((self.live / f"{C}.jsonl").exists())
+
+    def test_open_copy_is_left_alone(self):
+        self.copy_of_a(C)
+        self.set_open(C)
+        self.cli("--pending")
+        self.assertTrue((self.live / f"{C}.jsonl").exists())
+
+    def test_copy_restored_by_hand_stays(self):
+        self.copy_of_a(C)
+        self.cli("--pending")
+        self.cli("-r", "cccc")
+        self.cli("--pending")
+        self.assertTrue((self.live / f"{C}.jsonl").exists())
 
     def test_restore_all(self):
         self.cli("aaaa", "bbbb")
