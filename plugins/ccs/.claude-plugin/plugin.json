@@ -1,0 +1,5 @@
+{
+  "name": "ccs",
+  "version": "0.6.0",
+  "description": "/archive and /unarchive: move Claude Code sessions out of /resume (needs the ccs CLI from cc-tools)"
+}

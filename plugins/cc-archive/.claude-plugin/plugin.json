@@ -1,5 +1,0 @@
-{
-  "name": "cc-archive",
-  "version": "0.3.0",
-  "description": "/archive and /unarchive: move Claude Code sessions out of /resume (needs the cc-archive CLI from cc-tools)"
-}

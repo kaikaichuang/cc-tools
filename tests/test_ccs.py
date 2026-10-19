@@ -1,4 +1,4 @@
-"""Tests for bin/cc-archive against a fake HOME laid out like Claude Code's.
+"""Tests for bin/ccs against a fake HOME laid out like Claude Code's.
 
     python3 -m unittest discover -s tests
 """
@@ -12,7 +12,7 @@ import time
 import unittest
 from pathlib import Path
 
-CLI = Path(__file__).resolve().parent.parent / "bin" / "cc-archive"
+CLI = Path(__file__).resolve().parent.parent / "bin" / "ccs"
 A = "aaaaaaaa-0000-0000-0000-000000000001"
 B = "bbbbbbbb-0000-0000-0000-000000000002"
 C = "cccccccc-0000-0000-0000-000000000003"
@@ -30,7 +30,7 @@ class CcArchiveTest(unittest.TestCase):
         self.project.mkdir()
         self.live = self.home / ".claude/projects" / re.sub(r"[^a-zA-Z0-9]", "-", str(self.project))
         self.live.mkdir(parents=True)
-        self.archived = self.home / ".local/share/cc-archive" / self.live.name
+        self.archived = self.home / ".local/share/ccs" / self.live.name
         (self.home / ".claude/sessions").mkdir()
         old = time.time() - 3600
 
@@ -51,7 +51,7 @@ class CcArchiveTest(unittest.TestCase):
 
     def cli(self, *args, cwd=None):
         env = {**os.environ, "HOME": str(self.home)}
-        env.pop("CC_ARCHIVE_DIR", None)
+        env.pop("CCS_DIR", None)
         r = subprocess.run([str(CLI), *args], cwd=cwd or self.project, env=env, capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout
@@ -145,7 +145,7 @@ class CcArchiveTest(unittest.TestCase):
         self.assertTrue((self.live / f"{C}.jsonl").exists())
 
     def open_command(self, agents):
-        """bin/cc-archive's open_command, with `claude agents --json` answering agents."""
+        """bin/ccs's open_command, with `claude agents --json` answering agents."""
         fake = self.home / "bin"
         fake.mkdir(exist_ok=True)
         (fake / "claude").write_text(f"#!/bin/sh\necho '{json.dumps(agents)}'\n")

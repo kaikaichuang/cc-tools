@@ -3,7 +3,7 @@ import { expect, test } from 'claude-code/testing'
 
 const SID = 'abcd1234-0000-0000-0000-000000000000'
 
-// Stands in for the session and the cc-archive CLI: records each call and answers like the CLI would.
+// Stands in for the session and the ccs CLI: records each call and answers like the CLI would.
 function fakeCli(on: On, answer: string) {
   const calls: string[][] = []
   on('session.id', () => ({ value: SID }))
@@ -17,7 +17,7 @@ function fakeCli(on: On, answer: string) {
 test('/archive with no ID marks the current session', async ($, on) => {
   const calls = fakeCli(on, 'abcd1234 is open: it will be archived when it closes')
   const ran = await $.command.run({ command: 'archive' })
-  expect(calls).toEqual([['cc-archive', SID]])
+  expect(calls).toEqual([['ccs', SID]])
   expect(ran.text).toContain('when it closes')
 })
 
@@ -26,7 +26,7 @@ test('/archive ID and /unarchive ID pass the ID through', async ($, on) => {
   await $.command.run({ command: 'archive', args: '21ddae63' })
   await $.command.run({ command: 'unarchive', args: '21ddae63' })
   await $.command.run({ command: 'unarchive', args: 'list' })
-  expect(calls).toEqual([['cc-archive', '21ddae63'], ['cc-archive', '-r', '21ddae63'], ['cc-archive', '-l']])
+  expect(calls).toEqual([['ccs', '21ddae63'], ['ccs', '-r', '21ddae63'], ['ccs', '-l']])
 })
 
 test('a missing CLI is reported, not thrown', async ($, on) => {

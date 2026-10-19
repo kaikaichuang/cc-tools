@@ -1,7 +1,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-// The plugin only drives the cc-archive CLI (cc-tools/bin), which does the moving.
-const CLI = 'cc-archive'
+// The plugin only drives the ccs CLI (cc-tools/bin), which does the moving.
+const CLI = 'ccs'
 const PENDING_NOTE = 'archived after this session closes (/unarchive to cancel)'
 
 async function cli($: EngineInterface, args: string[]): Promise<string> {
@@ -26,7 +26,7 @@ export const register: Register = on => {
       argumentHint: '[ID | list]',
     })
     // Sessions marked by /archive are moved here, once the claude that held them has exited,
-    // rather than by a process left running after exit. cc-archive does the same on every run.
+    // rather than by a process left running after exit. ccs does the same on every run.
     await cli($, ['--pending'])
     return next(e)
   })
